@@ -1,16 +1,15 @@
-mod display;
-
-use display::Display;
 use std::error::Error;
 use std::ops;
 use std::time::Duration;
 
-use btleplug::api::{bleuuid::uuid_from_u16, Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::api::{Central, Manager as _, Peripheral as _};
 use rand::{Rng, thread_rng};
 use tokio::time;
 use tokio_stream::StreamExt;
-use uuid::Uuid;
 
+use display::Display;
+
+mod display;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -37,58 +36,67 @@ async fn tick(game: &mut Game, display: &Display) {
 }
 
 async fn update_ball(game: &mut Game, index: usize, display: &Display) {
-    let passable: u8 = if index == 0 { 0 } else { 1 };
-    let obstacle: u8 = if index == 0 { 1 } else { 0 };
+    let passable = if index == 0 { 0 } else { 1 };
+    let obstacle = if index == 0 { 1 } else { 0 };
     let fill_color = if index == 0 { COLOR_1 } else { COLOR_2 };
     let empty_color = if index == 0 { COLOR_2 } else { COLOR_1 };
-    let pos = game.balls.get_mut(index).unwrap();
-    let velocity = game.velocities.get_mut(index).unwrap();
-    let new_pos = pos.clone() + velocity.clone();
+    let pos = *game.balls.get(index).unwrap();
+    let velocity = *game.velocities.get(index).unwrap();
+    let new_pos = pos + velocity;
     let new_x_valid = new_pos.x >= 0 && new_pos.x < DIMENSION;
     let new_y_valid = new_pos.y >= 0 && new_pos.y < DIMENSION;
-    let mut new_velocity = velocity.clone();
-    if (!new_x_valid || game.data[pos.y][new_pos.x] == obstacle) {
+    let mut new_velocity = velocity;
+    if (!new_x_valid) {
         new_velocity.dx = -velocity.dx;
-        if new_x_valid {
-            game.data[pos.y][new_pos.x] = passable;
-            display.set_pixel(empty_color.clone(), XY { x: new_pos.x, y: pos.y }, true).await;
+    }
+    if (!new_y_valid) {
+        new_velocity.dy = -velocity.dy;
+    }
+    if (new_x_valid && new_y_valid) {
+        let next_x = pos.with_x(new_pos.x);
+        let next_y = pos.with_y(new_pos.y);
+        let collision_x = game.get(next_x) == obstacle;
+        let collision_y = game.get(next_y) == obstacle;
+        let collision_xy = game.get(new_pos) == obstacle;
+        if collision_x {
+            game.set(next_x, passable);
+            display.set_pixel(empty_color, next_x, true).await;
+        }
+        if collision_y {
+            game.set(next_y, passable);
+            display.set_pixel(empty_color, next_y, true).await;
+        }
+        if collision_xy {
+            game.set(new_pos, passable);
+            display.set_pixel(empty_color, new_pos, true).await;
+        }
+        if collision_x || collision_xy {
+            new_velocity.dx = -velocity.dx;
+        }
+        if collision_y || collision_xy {
+            new_velocity.dy = -velocity.dy;
         }
     }
-    if (!new_y_valid || game.data[new_pos.y][pos.x] == obstacle) {
-        new_velocity.dy = -velocity.dy;
-        if new_y_valid {
-            game.data[new_pos.y][pos.x] = passable;
-            display.set_pixel(empty_color.clone(), XY { x: pos.x, y: new_pos.y }, true).await;
-        }
-    }
-    if new_velocity == *velocity && game.data[new_pos.y][new_pos.x] == obstacle {
-        new_velocity.dx = -velocity.dx;
-        new_velocity.dy = -velocity.dy;
-        game.data[new_pos.y][new_pos.x] = passable;
-        display.set_pixel(empty_color.clone(), new_pos, true).await;
-    }
-    let old_pos = pos.clone();
-    *velocity = new_velocity;
-    *pos = pos.clone() + velocity.clone();
-    display.set_pixel(fill_color.clone(), pos.clone(), true).await;
-    display.set_pixel(empty_color.clone(), old_pos, true).await;
+    *game.velocities.get_mut(index).unwrap() = new_velocity;
+    *game.balls.get_mut(index).unwrap() = pos + new_velocity;
+    display.set_pixel(fill_color, pos + new_velocity, true).await;
+    display.set_pixel(empty_color, pos, true).await;
 }
 
-
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 struct Color {
     r: u8,
     g: u8,
     b: u8,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 struct XY {
     x: usize,
     y: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Velocity {
     dx: i8,
     dy: i8,
@@ -117,8 +125,17 @@ fn random_dir() -> i8 {
     if thread_rng().gen_bool(0.5) { 1 } else { -1 }
 }
 
+impl XY {
+    fn with_x(&self, new_x: usize) -> Self {
+        XY { x: new_x, y: self.y }
+    }
+    fn with_y(&self, new_y: usize) -> Self {
+        XY { x: self.x, y: new_y }
+    }
+}
+
 impl Game {
-    fn new() -> Game {
+    fn new() -> Self {
         let mut rng = thread_rng();
         let mut data = [[0; DIMENSION]; DIMENSION];
         let balls = [
@@ -135,5 +152,13 @@ impl Game {
             }
         }
         Game { data, balls, velocities, time: 0 }
+    }
+
+    fn get(&self, pos: XY) -> u8 {
+        self.data[pos.y][pos.x]
+    }
+
+    fn set(&mut self, pos: XY, value: u8) {
+        self.data[pos.y][pos.x] = value
     }
 }
