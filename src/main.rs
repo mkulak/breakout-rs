@@ -1,52 +1,42 @@
+mod display;
+
+use display::Display;
 use std::error::Error;
 use std::ops;
 use std::time::Duration;
 
 use btleplug::api::{bleuuid::uuid_from_u16, Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType};
-use btleplug::platform::{Adapter, Manager, Peripheral};
 use rand::{Rng, thread_rng};
 use tokio::time;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-const WRITE_UUID: Uuid = uuid_from_u16(0xfa02);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let manager = Manager::new().await?;
-
-    let adapters = manager.adapters().await?;
-    let central = adapters.into_iter().nth(0).unwrap();
-
-    let peripheral = find_device(central).await?;
-    peripheral.connect().await?;
-    peripheral.discover_services().await?;
-
-    let chars = peripheral.characteristics();
-    let cmd_char = chars.iter().find(|c| c.uuid == WRITE_UUID).unwrap();
-
+    let display = Display::new().await.unwrap();
     let mut game = Game::new();
 
     for y in 0..DIMENSION {
         for x in 0..DIMENSION {
             let color = if game.data[y][x] == 1 { COLOR_1 } else { COLOR_2 };
-            set_pixel(&peripheral, &cmd_char, color.clone(), XY { x, y }, true).await;
+            display.set_pixel(color.clone(), XY { x, y }, true).await;
         }
     }
 
     loop {
-        tick(&mut game, &peripheral, &cmd_char).await;
+        tick(&mut game, &display).await;
         time::sleep(Duration::from_millis(1)).await;
     }
 }
 
-async fn tick(game: &mut Game, p: &Peripheral, c: &Characteristic) {
+async fn tick(game: &mut Game, display: &Display) {
     game.time += 1;
-    update_ball(game, 0, p, c).await;
-    update_ball(game, 1, p, c).await;
+    update_ball(game, 0, display).await;
+    update_ball(game, 1, display).await;
 }
 
-async fn update_ball(game: &mut Game, index: usize, p: &Peripheral, c: &Characteristic) {
+async fn update_ball(game: &mut Game, index: usize, display: &Display) {
     let passable: u8 = if index == 0 { 0 } else { 1 };
     let obstacle: u8 = if index == 0 { 1 } else { 0 };
     let fill_color = if index == 0 { COLOR_1 } else { COLOR_2 };
@@ -61,55 +51,29 @@ async fn update_ball(game: &mut Game, index: usize, p: &Peripheral, c: &Characte
         new_velocity.dx = -velocity.dx;
         if new_x_valid {
             game.data[pos.y][new_pos.x] = passable;
-            set_pixel(p, c, empty_color.clone(), XY { x: new_pos.x, y: pos.y }, true).await;
+            display.set_pixel(empty_color.clone(), XY { x: new_pos.x, y: pos.y }, true).await;
         }
     }
     if (!new_y_valid || game.data[new_pos.y][pos.x] == obstacle) {
         new_velocity.dy = -velocity.dy;
         if new_y_valid {
             game.data[new_pos.y][pos.x] = passable;
-            set_pixel(p, c, empty_color.clone(), XY { x: pos.x, y: new_pos.y }, true).await;
+            display.set_pixel(empty_color.clone(), XY { x: pos.x, y: new_pos.y }, true).await;
         }
     }
     if new_velocity == *velocity && game.data[new_pos.y][new_pos.x] == obstacle {
         new_velocity.dx = -velocity.dx;
         new_velocity.dy = -velocity.dy;
         game.data[new_pos.y][new_pos.x] = passable;
-        set_pixel(p, c, empty_color.clone(), new_pos, true).await;
+        display.set_pixel(empty_color.clone(), new_pos, true).await;
     }
     let old_pos = pos.clone();
     *velocity = new_velocity;
     *pos = pos.clone() + velocity.clone();
-    set_pixel(p, c, fill_color.clone(), pos.clone(), true).await;
-    set_pixel(p, c, empty_color.clone(), old_pos, true).await;
+    display.set_pixel(fill_color.clone(), pos.clone(), true).await;
+    display.set_pixel(empty_color.clone(), old_pos, true).await;
 }
 
-async fn set_pixel(p: &Peripheral, c: &Characteristic, color: Color, xy: XY, wait: bool) {
-    let cmd = vec![10, 0, 5, 1, 0, color.r, color.g, color.b, xy.x as u8, xy.y as u8];
-    let write_type = if wait { WriteType::WithResponse } else { WriteType::WithoutResponse };
-    let _ = p.write(c, &cmd, write_type).await;
-    // time::sleep(Duration::from_millis(1)).await;
-}
-
-async fn find_device(central: Adapter) -> Result<Peripheral, Box<dyn Error>> {
-    let mut events = central.events().await?;
-    central.start_scan(ScanFilter::default()).await?;
-    while let Some(event) = events.next().await {
-        match event {
-            CentralEvent::DeviceDiscovered(address) => {
-                let peripheral = central.peripheral(&address).await.unwrap();
-                let props = peripheral.properties().await.unwrap().unwrap();
-                if props.local_name.iter().any(|name| name.contains("IDM-")) {
-                    println!("Device found: {:?}", props);
-                    println!("Address: {:?}", address);
-                    return Ok(peripheral);
-                }
-            }
-            _ => (),
-        }
-    }
-    Err(Box::new(btleplug::Error::DeviceNotFound))
-}
 
 #[derive(Clone, Debug)]
 struct Color {
