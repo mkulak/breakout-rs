@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::ops;
 use std::time::Duration;
 
 use btleplug::api::{bleuuid::uuid_from_u16, Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType};
@@ -8,8 +9,6 @@ use tokio::time;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-// "0000fa02-0000-1000-8000-00805f9b34fb"
-// "0x00000000_0000_1000_8000_00805f9b34fb"
 const WRITE_UUID: Uuid = uuid_from_u16(0xfa02);
 
 #[tokio::main]
@@ -26,28 +25,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let chars = peripheral.characteristics();
     let cmd_char = chars.iter().find(|c| c.uuid == WRITE_UUID).unwrap();
 
-    let mut rng = thread_rng();
+    let mut game = Game::new();
 
-    let mut game = Game {
-        data: [[0; DIMENSION]; DIMENSION],
-        ball1: XY { x: 0, y: rng.gen_range((DIMENSION / 2 - DIMENSION / 3)..(DIMENSION / 2 + DIMENSION / 3)) as i8 },
-        ball2: XY { x: (DIMENSION - 1) as i8, y: rng.gen_range((DIMENSION / 2 - DIMENSION / 3)..(DIMENSION / 2 + DIMENSION / 3)) as i8 },
-        ball_speed_1: XY { x: if rng.gen_bool(0.5) { 1 } else { -1 }, y: if rng.gen_bool(0.5) { 1 } else { -1 } },
-        ball_speed_2: XY { x: if rng.gen_bool(0.5) { 1 } else { -1 }, y: if rng.gen_bool(0.5) { 1 } else { -1 } },
-        time: 0,
-    };
-    for y in 0..DIMENSION {
-        for x in DIMENSION / 2..DIMENSION {
-            game.data[y][x] = 1
-        }
-    }
     for y in 0..DIMENSION {
         for x in 0..DIMENSION {
             let color = if game.data[y][x] == 1 { COLOR_1 } else { COLOR_2 };
-            set_pixel(&peripheral, &cmd_char, color.clone(), XY { x: x as i8, y: y as i8 }, true).await;
-            // time::sleep(Duration::from_millis(1)).await;
+            set_pixel(&peripheral, &cmd_char, color.clone(), XY { x, y }, true).await;
         }
-        time::sleep(Duration::from_millis(50)).await;
     }
 
     loop {
@@ -58,56 +42,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn tick(game: &mut Game, p: &Peripheral, c: &Characteristic) {
     game.time += 1;
-    update_ball(game, true, p, c).await;
-    update_ball(game, false, p, c).await;
+    update_ball(game, 0, p, c).await;
+    update_ball(game, 1, p, c).await;
 }
 
-async fn update_ball(game: &mut Game, first: bool, p: &Peripheral, c: &Characteristic) {
-    let passable: u8 = if first { 0 } else { 1 };
-    let obstacle: u8 = if first { 1 } else { 0 };
-    let ball: &mut XY = if first { &mut game.ball1 } else { &mut game.ball2 };
-    let ball_speed: &mut XY = if first { &mut game.ball_speed_1 } else { &mut game.ball_speed_2 };
-    let fill_color = if first { COLOR_1 } else { COLOR_2 };
-    let empty_color = if first { COLOR_2 } else { COLOR_1 };
-    let new_x = (ball.x + ball_speed.x) as usize;
-    let new_y = (ball.y + ball_speed.y) as usize;
-    let new_x_valid = new_x >= 0 && new_x < DIMENSION;
-    let new_y_valid = new_y >= 0 && new_y < DIMENSION;
-    let mut new_dx = ball_speed.x;
-    let mut new_dy = ball_speed.y;
-    if (!new_x_valid || game.data[ball.y as usize][new_x] == obstacle) {
-        new_dx = -ball_speed.x;
+async fn update_ball(game: &mut Game, index: usize, p: &Peripheral, c: &Characteristic) {
+    let passable: u8 = if index == 0 { 0 } else { 1 };
+    let obstacle: u8 = if index == 0 { 1 } else { 0 };
+    let fill_color = if index == 0 { COLOR_1 } else { COLOR_2 };
+    let empty_color = if index == 0 { COLOR_2 } else { COLOR_1 };
+    let pos = game.balls.get_mut(index).unwrap();
+    let velocity = game.velocities.get_mut(index).unwrap();
+    let new_pos = pos.clone() + velocity.clone();
+    let new_x_valid = new_pos.x >= 0 && new_pos.x < DIMENSION;
+    let new_y_valid = new_pos.y >= 0 && new_pos.y < DIMENSION;
+    let mut new_velocity = velocity.clone();
+    if (!new_x_valid || game.data[pos.y][new_pos.x] == obstacle) {
+        new_velocity.dx = -velocity.dx;
         if new_x_valid {
-            game.data[ball.y as usize][new_x] = passable;
-            set_pixel(p, c, empty_color.clone(), XY { x: new_x as i8, y: ball.y }, true).await;
+            game.data[pos.y][new_pos.x] = passable;
+            set_pixel(p, c, empty_color.clone(), XY { x: new_pos.x, y: pos.y }, true).await;
         }
     }
-    if (!new_y_valid || game.data[new_y][ball.x as usize] == obstacle) {
-        new_dy = -ball_speed.y;
+    if (!new_y_valid || game.data[new_pos.y][pos.x] == obstacle) {
+        new_velocity.dy = -velocity.dy;
         if new_y_valid {
-            game.data[new_y][ball.x as usize] = passable;
-            set_pixel(p, c, empty_color.clone(), XY { x: ball.x, y: new_y as i8 }, true).await;
+            game.data[new_pos.y][pos.x] = passable;
+            set_pixel(p, c, empty_color.clone(), XY { x: pos.x, y: new_pos.y }, true).await;
         }
     }
-    if new_dx == ball_speed.x && new_dy == ball_speed.y && game.data[new_y][new_x] == obstacle {
-        new_dx = -ball_speed.x;
-        new_dy = -ball_speed.y;
-        game.data[new_y][new_x] = passable;
-        set_pixel(p, c, empty_color.clone(), XY { x: new_x as i8, y: new_y as i8 }, true).await;
+    if new_velocity == *velocity && game.data[new_pos.y][new_pos.x] == obstacle {
+        new_velocity.dx = -velocity.dx;
+        new_velocity.dy = -velocity.dy;
+        game.data[new_pos.y][new_pos.x] = passable;
+        set_pixel(p, c, empty_color.clone(), new_pos, true).await;
     }
-    ball_speed.x = new_dx;
-    ball_speed.y = new_dy;
-    let old_pos = ball.clone();
-    ball.x += ball_speed.x;
-    ball.y += ball_speed.y;
-    set_pixel(p, c, fill_color.clone(), ball.clone(), true).await;
+    let old_pos = pos.clone();
+    *velocity = new_velocity;
+    *pos = pos.clone() + velocity.clone();
+    set_pixel(p, c, fill_color.clone(), pos.clone(), true).await;
     set_pixel(p, c, empty_color.clone(), old_pos, true).await;
 }
 
 async fn set_pixel(p: &Peripheral, c: &Characteristic, color: Color, xy: XY, wait: bool) {
     let cmd = vec![10, 0, 5, 1, 0, color.r, color.g, color.b, xy.x as u8, xy.y as u8];
     let write_type = if wait { WriteType::WithResponse } else { WriteType::WithoutResponse };
-    // let _ = p.write(c, &cmd, WriteType::WithoutResponse).await;
     let _ = p.write(c, &cmd, write_type).await;
     // time::sleep(Duration::from_millis(1)).await;
 }
@@ -141,19 +120,56 @@ struct Color {
 
 #[derive(Clone, Debug)]
 struct XY {
-    x: i8,
-    y: i8,
+    x: usize,
+    y: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Velocity {
+    dx: i8,
+    dy: i8,
 }
 
 struct Game {
     data: [[u8; DIMENSION]; DIMENSION],
-    ball1: XY,
-    ball_speed_1: XY,
-    ball2: XY,
-    ball_speed_2: XY,
+    balls: [XY; 2],
+    velocities: [Velocity; 2],
     time: u32,
 }
 
 const DIMENSION: usize = 32;
 const COLOR_1: Color = Color { r: 30, g: 255, b: 30 };
 const COLOR_2: Color = Color { r: 255, g: 50, b: 50 };
+
+impl ops::Add<Velocity> for XY {
+    type Output = XY;
+
+    fn add(self, rhs: Velocity) -> Self::Output {
+        XY { x: (self.x as i8 + rhs.dx) as usize, y: (self.y as i8 + rhs.dy) as usize }
+    }
+}
+
+fn random_dir() -> i8 {
+    if thread_rng().gen_bool(0.5) { 1 } else { -1 }
+}
+
+impl Game {
+    fn new() -> Game {
+        let mut rng = thread_rng();
+        let mut data = [[0; DIMENSION]; DIMENSION];
+        let balls = [
+            XY { x: 0, y: rng.gen_range((DIMENSION / 2 - DIMENSION / 3)..(DIMENSION / 2 + DIMENSION / 3)) },
+            XY { x: DIMENSION - 1, y: rng.gen_range((DIMENSION / 2 - DIMENSION / 3)..(DIMENSION / 2 + DIMENSION / 3)) }
+        ];
+        let velocities = [
+            Velocity { dx: random_dir(), dy: random_dir() },
+            Velocity { dx: random_dir(), dy: random_dir() }
+        ];
+        for y in 0..DIMENSION {
+            for x in DIMENSION / 2..DIMENSION {
+                data[y][x] = 1;
+            }
+        }
+        Game { data, balls, velocities, time: 0 }
+    }
+}
