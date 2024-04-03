@@ -3,6 +3,7 @@ use std::ops;
 use std::time::Duration;
 
 use btleplug::api::{Central, Manager as _, Peripheral as _};
+use circular_buffer::CircularBuffer;
 use rand::{Rng, thread_rng};
 use tokio::time;
 use tokio_stream::StreamExt;
@@ -76,11 +77,33 @@ async fn update_ball(game: &mut Game, index: usize, display: &Display) {
         if collision_y || collision_xy {
             new_velocity.dy = -velocity.dy;
         }
+        if index == 0 && velocity != new_velocity {
+            let state = calc_state(pos, velocity, collision_x, collision_y, collision_xy);
+            if game.prev_states.iter().any(|prev| state == *prev) {
+                println!("Collision detected: {:?}", state);
+                if thread_rng().gen_bool(0.5) {
+                    new_velocity.dx = -new_velocity.dx
+                } else {
+                    new_velocity.dy = -new_velocity.dy
+                }
+            }
+            game.prev_states.push_back(state);
+        }
     }
     *game.velocities.get_mut(index).unwrap() = new_velocity;
     *game.balls.get_mut(index).unwrap() = pos + new_velocity;
     display.set_pixel(fill_color, pos + new_velocity, true).await;
     display.set_pixel(empty_color, pos, true).await;
+}
+
+fn calc_state(pos: XY, velocity: Velocity, cx: bool, cy: bool, cxy: bool) -> u32 {
+    ((pos.x as u32) << 24)
+        .wrapping_add((pos.y as u32) << 16)
+        .wrapping_add((velocity.dx as u32) << 8)
+        .wrapping_add(velocity.dy as u32)
+        .wrapping_add(if cx { 1 } else { 0 })
+        .wrapping_add(if cy { 1 } else { 0 })
+        .wrapping_add(if cxy { 1 } else { 0 })
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -107,6 +130,7 @@ struct Game {
     balls: [XY; 2],
     velocities: [Velocity; 2],
     time: u32,
+    prev_states: CircularBuffer<8, u32>
 }
 
 const DIMENSION: usize = 32;
@@ -138,10 +162,18 @@ impl Game {
     fn new() -> Self {
         let mut rng = thread_rng();
         let mut data = [[0; DIMENSION]; DIMENSION];
+        // let balls = [
+        //     XY { x: 0, y: DIMENSION / 2 },
+        //     XY { x: DIMENSION - 1, y: DIMENSION / 2 }
+        // ];
         let balls = [
             XY { x: 0, y: rng.gen_range((DIMENSION / 2 - DIMENSION / 3)..(DIMENSION / 2 + DIMENSION / 3)) },
             XY { x: DIMENSION - 1, y: rng.gen_range((DIMENSION / 2 - DIMENSION / 3)..(DIMENSION / 2 + DIMENSION / 3)) }
         ];
+        // let velocities = [
+        //     Velocity { dx: 1, dy: 1 },
+        //     Velocity { dx: -1, dy: 1 }
+        // ];
         let velocities = [
             Velocity { dx: random_dir(), dy: random_dir() },
             Velocity { dx: random_dir(), dy: random_dir() }
@@ -151,7 +183,7 @@ impl Game {
                 data[y][x] = 1;
             }
         }
-        Game { data, balls, velocities, time: 0 }
+        Game { data, balls, velocities, time: 0, prev_states: CircularBuffer::new() }
     }
 
     fn get(&self, pos: XY) -> u8 {
